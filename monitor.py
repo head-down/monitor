@@ -23,9 +23,11 @@ from core.face_detector import FaceDetector
 pyautogui.FAILSAFE = False
 
 # ================= 配置文件路径 =================
-CONFIG_FILE = "moyu_config.json"
-PROTOTXT_PATH = "face_deploy.prototxt"
-MODEL_PATH = "face_res10.caffemodel"
+# 模型跟随 exe 打包，通过 sys._MEIPASS 或脚本目录定位
+_PROGRAM_DIR = sys._MEIPASS if getattr(sys, 'frozen', False) else os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = "moyu_config.json"  # 用户配置始终在运行目录
+PROTOTXT_PATH = os.path.join(_PROGRAM_DIR, "face_deploy.prototxt")
+MODEL_PATH = os.path.join(_PROGRAM_DIR, "face_res10.caffemodel")
 
 # ================= 默认配置 =================
 DEFAULT_CONFIG = {
@@ -37,13 +39,11 @@ DEFAULT_CONFIG = {
 
 # ================= 单实例检测 =================
 def ensure_single_instance():
-    """确保只有一个实例运行"""
-    mutex_name = "Global\\MoyuShouhuShen_SingleInstance_Mutex"
+    """确保只有一个实例运行（Windows 命名 Mutex）"""
     kernel32 = ctypes.windll.kernel32
-    mutex = kernel32.CreateMutexW(None, False, mutex_name)
-    last_error = kernel32.GetLastError()
-    if last_error == 183:
-        messagebox.showwarning("提示", "摸鱼守护神已在运行！")
+    mutex = kernel32.CreateMutexW(None, False, "MoyuGuardian_SingleInstance")
+    if kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+        kernel32.CloseHandle(mutex)
         sys.exit(0)
     return mutex
 
@@ -106,7 +106,7 @@ class SettingsWindow:
         self.root.title("摸鱼守护神 - 设置")
         self.root.geometry(f"{self.WIDTH}x{self.HEIGHT}")
         self.root.resizable(False, False)
-        self.root.protocol("WM_DELETE_WINDOW", self.root.destroy)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         # 居中显示
         self.root.update_idletasks()
@@ -122,7 +122,7 @@ class SettingsWindow:
         btn_bar.pack(side="bottom", fill="x", padx=25, pady=(6, 22))
 
         ctk.CTkButton(
-            btn_bar, text="取消", command=self.root.destroy,
+            btn_bar, text="取消", command=self._on_close,
             font=ctk.CTkFont(size=14),
             fg_color="transparent", border_width=1.5,
             text_color=("gray10", "gray90"),
@@ -365,6 +365,11 @@ class SettingsWindow:
         if self.on_save_callback:
             self.on_save_callback(self.config)
 
+    def _on_close(self):
+        """关闭设置窗口并退出程序"""
+        self.root.destroy()
+        sys.exit(0)
+
     def run(self):
         self.root.mainloop()
 
@@ -532,7 +537,7 @@ def run_monitor(config):
         cv2.destroyAllWindows()
 
 def main():
-    _mutex = ensure_single_instance()  # 持有引用防止 GC 提前释放 Mutex
+    _mutex = ensure_single_instance()  # 持有引用防止 GC 释放
     config = load_config()
     if not config.get("work_app_title"):
         def on_save(new_config):
