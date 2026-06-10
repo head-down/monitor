@@ -25,6 +25,16 @@ from core.window_enumerator import WindowEnumerator
 
 # ================= 全局退出信号 =================
 
+# Python 3.12+: 抑制 tkinter Variable.__del__ 在进程退出时的 RuntimeError
+if hasattr(sys, 'unraisablehook'):
+    _original_unraisable = sys.unraisablehook
+    def _unraisable_hook(args):
+        if (isinstance(args.exc_value, RuntimeError)
+                and "main thread is not in main loop" in str(args.exc_value)):
+            return
+        _original_unraisable(args)
+    sys.unraisablehook = _unraisable_hook
+
 class Application:
     """管理程序生命周期和退出信号。
 
