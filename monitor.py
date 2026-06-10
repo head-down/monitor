@@ -765,7 +765,40 @@ def run_monitor(config):
         tray.stop()
         print("[*] 摸鱼守护神已关闭。")
 
+def _restart_as_monitor(mutex_handle):
+    """释放单实例锁，用子进程重启直接进入监控模式。
+
+    根因：tkinter/customtkinter 的 root.destroy() 会清理 Tcl 解释器和
+    Windows 消息泵状态，导致后续在同进程中创建 pystray 托盘图标失败
+    （Shell_NotifyIcon 无法正常工作）。通过子进程重启，完全隔离 tkinter
+    和 pystray 的运行环境，彻底规避此问题。
+    """
+    import subprocess
+
+    # 先释放单实例锁，让子进程能成功获取同名 Mutex
+    ctypes.windll.kernel32.CloseHandle(mutex_handle)
+
+    # 构建子进程命令
+    if getattr(sys, 'frozen', False):
+        cmd = [sys.executable, '--monitor']
+    else:
+        cmd = [sys.executable, os.path.abspath(sys.argv[0]), '--monitor']
+
+    # CREATE_NO_WINDOW 避免闪现控制台窗口
+    creationflags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+    subprocess.Popen(cmd, creationflags=creationflags)
+    sys.exit(0)
+
+
 def main():
+    # --monitor 标志：直接启动监控（设置保存后子进程重启使用）
+    if '--monitor' in sys.argv:
+        _mutex = ensure_single_instance()
+        config = load_config()
+        if config.work_app_title:
+            run_monitor(config)
+        sys.exit(0)
+
     _mutex = ensure_single_instance()  # 持有引用防止 GC 释放
     config = load_config()
 
@@ -780,7 +813,7 @@ def main():
             settings.run()
 
             if settings._saved:
-                run_monitor(config)
+                _restart_as_monitor(_mutex)
             sys.exit(0)
         else:
             root = tk.Tk()
@@ -809,10 +842,7 @@ def main():
                 settings.run()
 
                 if settings._saved:
-                    run_monitor(config)
-                    return
-                continue
-                # 用户关闭了设置窗口但没保存 → 回到主弹窗
+                    _restart_as_monitor(_mutex)
                 continue
             else:
                 root.destroy()
