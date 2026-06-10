@@ -748,6 +748,11 @@ def run_monitor(config):
             image = cv2.flip(image, 1)
             state = detector.process_frame(image)
 
+            # 检测器降级：DNN 连续异常超过阈值则安全退出
+            if not detector.is_healthy():
+                print("[!] 人脸检测器异常，程序退出。")
+                break
+
             if state.edge_rising:
                 reactor.trigger()
 
