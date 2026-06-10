@@ -175,12 +175,20 @@ PROTOTXT_PATH = os.path.join(_PROGRAM_DIR, "face_deploy.prototxt")
 MODEL_PATH = os.path.join(_PROGRAM_DIR, "face_res10.caffemodel")
 
 # ================= 默认配置 =================
-DEFAULT_CONFIG = {
-    "work_app_title": "",
-    "work_app_exe": "",       # 新增：进程名，如 idea64.exe / chrome.exe
-    "stealth_mode": False,
-    "cooldown_time": 5.0
-}
+from dataclasses import dataclass, asdict
+
+@dataclass
+class MonitorConfig:
+    """运行时配置，类型安全的字段访问。
+
+    字段不变更时直接在实例上读写，save_config() 通过 dataclasses.asdict() 序列化。
+    """
+    work_app_title: str = ""
+    work_app_exe: str = ""
+    stealth_mode: bool = False
+    cooldown_time: float = 5.0
+
+DEFAULT_CONFIG = MonitorConfig()
 
 # ================= 单实例检测 =================
 def ensure_single_instance():
@@ -194,26 +202,32 @@ def ensure_single_instance():
 
 # ================= 配置管理 =================
 def load_config():
-    """加载配置"""
+    """加载配置，返回 MonitorConfig 实例。"""
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                config = json.load(f)
-            for key in DEFAULT_CONFIG:
-                if key not in config:
-                    config[key] = DEFAULT_CONFIG[key]
-            return config
+                data = json.load(f)
+            return MonitorConfig(
+                work_app_title=data.get("work_app_title", DEFAULT_CONFIG.work_app_title),
+                work_app_exe=data.get("work_app_exe", DEFAULT_CONFIG.work_app_exe),
+                stealth_mode=data.get("stealth_mode", DEFAULT_CONFIG.stealth_mode),
+                cooldown_time=data.get("cooldown_time", DEFAULT_CONFIG.cooldown_time),
+            )
         except Exception:
             print(f"[!] 读取配置文件失败，使用默认配置。")
-            pass
-    return DEFAULT_CONFIG.copy()
+    return MonitorConfig(
+        work_app_title=DEFAULT_CONFIG.work_app_title,
+        work_app_exe=DEFAULT_CONFIG.work_app_exe,
+        stealth_mode=DEFAULT_CONFIG.stealth_mode,
+        cooldown_time=DEFAULT_CONFIG.cooldown_time,
+    )
 
 def save_config(config):
-    """保存配置（先写临时文件再原子替换，防止写入中断导致配置丢失）"""
+    """保存配置（先写临时文件再原子替换）。config 为 MonitorConfig 实例。"""
     tmp = CONFIG_FILE + '.tmp'
     try:
         with open(tmp, 'w', encoding='utf-8') as f:
-            json.dump(config, f, ensure_ascii=False, indent=2)
+            json.dump(asdict(config), f, ensure_ascii=False, indent=2)
         os.replace(tmp, CONFIG_FILE)
     except Exception as e:
         print(f"[!] 保存配置失败: {e}")
@@ -323,7 +337,7 @@ class SettingsWindow:
         ).pack(anchor="w", padx=28)
 
         # 下拉选择
-        self.app_var = ctk.StringVar(value=self.config.get("work_app_title", ""))
+        self.app_var = ctk.StringVar(value=self.config.work_app_title)
         self.app_combo = ctk.CTkComboBox(
             card, variable=self.app_var,
             values=[""],
@@ -335,7 +349,7 @@ class SettingsWindow:
         self.app_combo.pack(fill="x", padx=28, pady=(14, 4))
 
         # 进程名提示
-        exe_name = self.config.get("work_app_exe", "未绑定")
+        exe_name = self.config.work_app_exe if self.config.work_app_exe else "未绑定"
         self._exe_label_var = ctk.StringVar(value=f"进程名：{exe_name}")
         ctk.CTkLabel(
             card, textvariable=self._exe_label_var,
@@ -380,7 +394,7 @@ class SettingsWindow:
             cd_frame, text="冷却时间", font=ctk.CTkFont(size=13),
         ).pack(side="left")
 
-        self.cooldown_var = ctk.IntVar(value=int(self.config.get("cooldown_time", 5)))
+        self.cooldown_var = ctk.IntVar(value=int(self.config.cooldown_time))
         self._cd_label = ctk.CTkLabel(
             cd_frame, text="", font=ctk.CTkFont(size=13), width=40,
         )
@@ -399,7 +413,7 @@ class SettingsWindow:
         stealth_frame = ctk.CTkFrame(card, fg_color="transparent")
         stealth_frame.pack(fill="x", padx=28, pady=(18, 4))
 
-        self.stealth_var = ctk.BooleanVar(value=self.config.get("stealth_mode", False))
+        self.stealth_var = ctk.BooleanVar(value=self.config.stealth_mode)
         ctk.CTkCheckBox(
             stealth_frame,
             text="隐蔽模式（隐藏预览窗口）",
@@ -495,7 +509,7 @@ class SettingsWindow:
     def _on_app_selected(self, value):
         """下拉框选中时，自动读取对应进程名并显示"""
         exe = self._title_exe_map.get(value, "")
-        self.config["work_app_exe"] = exe
+        self.config.work_app_exe = exe
         self._exe_label_var.set(
             f"进程名：{exe if exe else '未能识别，将使用标题匹配'}"
         )
@@ -507,10 +521,9 @@ class SettingsWindow:
             messagebox.showwarning("提示", "请选择或输入目标应用窗口标题！")
             return
 
-        self.config["work_app_title"] = app_title
-        self.config["work_app_exe"] = self.config.get("work_app_exe", "")
-        self.config["cooldown_time"] = float(self.cooldown_var.get())
-        self.config["stealth_mode"] = self.stealth_var.get()
+        self.config.work_app_title = app_title
+        self.config.cooldown_time = float(self.cooldown_var.get())
+        self.config.stealth_mode = self.stealth_var.get()
 
         save_config(self.config)
         self._saved = True
@@ -700,7 +713,7 @@ def run_monitor(config):
     print("[*] 神经网络加载完成", flush=True)
 
     detector = FaceDetector(net)
-    reactor = WindowReactor(config["work_app_title"], config.get("work_app_exe", ""), config["cooldown_time"])
+    reactor = WindowReactor(config.work_app_title, config.work_app_exe, config.cooldown_time)
 
     print("[*] 正在打开摄像头...", flush=True)
     cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
@@ -709,7 +722,7 @@ def run_monitor(config):
         messagebox.showerror("错误", "无法打开摄像头！可能被其他程序占用。")
         return
 
-    stealth_mode = config.get("stealth_mode", False)
+    stealth_mode = config.stealth_mode
 
     # 全局热键退出
     quit_watcher = QuitWatcher(app)
@@ -721,8 +734,8 @@ def run_monitor(config):
 
     print("=" * 50)
     print(f"摸鱼守护神已启动！")
-    print(f"   目标应用: {config['work_app_title']}")
-    print(f"   冷却时间: {config['cooldown_time']} 秒")
+    print(f"   目标应用: {config.work_app_title}")
+    print(f"   冷却时间: {config.cooldown_time} 秒")
     print(f"   退出方式: 右击系统托盘图标 或 按 Ctrl+Alt+Q")
     if not stealth_mode:
         print("   也可按 ESC 键关闭预览窗口退出")
@@ -762,7 +775,7 @@ def run_monitor(config):
                 display_img = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
                 cv2.putText(display_img, f"Targets: {state.face_count}", (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-                cv2.putText(display_img, f"App: {config['work_app_title'][:30]}", (10, 60),
+                cv2.putText(display_img, f"App: {config.work_app_title[:30]}", (10, 60),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
                 cv2.putText(display_img, "Ctrl+Alt+Q to quit", (10, 450),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, (150, 150, 150), 1)
@@ -784,7 +797,7 @@ def main():
     config = load_config()
 
     while True:
-        if not config.get("work_app_title"):
+        if not config.work_app_title:
             def on_save(new_config):
                 run_monitor(new_config)
 
@@ -797,7 +810,7 @@ def main():
 
             result = messagebox.askyesnocancel(
                 "摸鱼守护神",
-                f"当前目标应用: {config['work_app_title']}\n\n"
+                f"当前目标应用: {config.work_app_title}\n\n"
                 "【是】- 直接启动\n"
                 "【否】- 修改设置\n"
                 "【取消】- 退出程序"
