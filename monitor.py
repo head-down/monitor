@@ -21,6 +21,7 @@ except ImportError:
     HAS_PSUTIL = False
 
 from core.face_detector import FaceDetector
+from core.window_enumerator import WindowEnumerator
 
 # ================= 全局退出信号 =================
 
@@ -433,75 +434,15 @@ class SettingsWindow:
         self._cd_label.configure(text=f"{int(float(value))} 秒")
 
     def refresh_windows(self, show_popup=False):
-        """刷新当前打开的窗口列表，排除文件资源管理器并去重 IDE 多文件窗口"""
+        """刷新当前打开的窗口列表，委托 WindowEnumerator 完成枚举和去重。"""
         try:
-            windows = gw.getAllWindows()
-            folder_keywords = [
-                "本地磁盘", "此电脑", "回收站", "控制面板", "网络",
-                "Desktop", "文档", "下载", "图片", "音乐", "视频",
-                "OneDrive", "Quick Access", "快速访问", "库", "个人",
-            ]
-
-            # 构建 hwnd → 进程名 的映射（需要 psutil）
-            hwnd_to_exe = {}
-            if HAS_PSUTIL:
-                for w in windows:
-                    try:
-                        pid = ctypes.c_ulong()
-                        ctypes.windll.user32.GetWindowThreadProcessId(w._hWnd, ctypes.byref(pid))
-                        proc = psutil.Process(pid.value)
-                        hwnd_to_exe[w._hWnd] = proc.name()
-                    except Exception:
-                        pass
-
-            raw_titles = set()
-            self._title_exe_map = {}
-            for w in windows:
-                if not w.title or not w.visible:
-                    continue
-                title = w.title.strip()
-                if not title:
-                    continue
-                if "\\" in title or "/" in title:
-                    continue
-                if any(kw in title for kw in folder_keywords):
-                    continue
-                raw_titles.add(title)
-                if w._hWnd in hwnd_to_exe:
-                    self._title_exe_map[title] = hwnd_to_exe[w._hWnd]
-
-            # 按公共后缀去重
-            suffix_counter = {}
-            suffix_exe_map = {}
-            for title in raw_titles:
-                parts = title.split(" - ")
-                for n in range(1, len(parts)):
-                    suffix = " - ".join(parts[n:])
-                    suffix_counter[suffix] = suffix_counter.get(suffix, 0) + 1
-                    if suffix not in suffix_exe_map and title in self._title_exe_map:
-                        suffix_exe_map[suffix] = self._title_exe_map[title]
-
-            display_titles = []
-            covered = set()
-
-            for suffix, count in sorted(suffix_counter.items(), key=lambda x: -x[1]):
-                if count >= 2 and suffix not in display_titles:
-                    display_titles.append(suffix)
-                    if suffix in suffix_exe_map:
-                        self._title_exe_map[suffix] = suffix_exe_map[suffix]
-                    for title in raw_titles:
-                        if title.endswith(" - " + suffix):
-                            covered.add(title)
-
-            for title in sorted(raw_titles):
-                if title not in covered:
-                    display_titles.append(title)
-
+            enumerator = WindowEnumerator()
+            display_titles, self._title_exe_map = enumerator.enumerate()
             self.app_combo.configure(values=display_titles)
             if show_popup:
                 messagebox.showinfo(
                     "提示",
-                    f"已获取 {len(display_titles)} 个窗口（原始 {len(raw_titles)} 个）",
+                    f"已获取 {len(display_titles)} 个窗口",
                 )
         except Exception as e:
             messagebox.showerror("错误", f"获取窗口列表失败: {e}")
