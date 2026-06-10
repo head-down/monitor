@@ -10,9 +10,11 @@ import sys
 import json
 import threading
 import signal
-import tkinter as tk
-from tkinter import ttk, messagebox
-import customtkinter as ctk
+
+# tkinter / customtkinter 延迟导入，避免 --monitor 子进程加载 Tcl/Tcl 运行时失败
+tk = None
+ctk = None
+messagebox = None
 
 try:
     import psutil
@@ -206,13 +208,25 @@ class MonitorConfig:
 
 DEFAULT_CONFIG = MonitorConfig()
 
+# ================= Windows 原生弹窗（不依赖 tkinter） =================
+def _win_msgbox(title, text, style=0x10):
+    """用 Windows API MessageBoxW 弹窗，不需要 tkinter/Tcl 运行时。
+
+    style: 0x10=MB_ICONERROR, 0x30=MB_ICONWARNING, 0x40=MB_ICONINFORMATION
+    """
+    ctypes.windll.user32.MessageBoxW(None, text, title, style)
+
 # ================= 单实例检测 =================
 def ensure_single_instance():
-    """确保只有一个实例运行（Windows 命名 Mutex）"""
+    """确保只有一个实例运行（Windows 命名 Mutex）
+    
+    如果已有实例在运行，弹出提示并退出。
+    """
     kernel32 = ctypes.windll.kernel32
     mutex = kernel32.CreateMutexW(None, False, "MoyuGuardian_SingleInstance")
     if kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
         kernel32.CloseHandle(mutex)
+        _win_msgbox("摸鱼守护神", "程序已在运行中！（系统托盘图标或 Ctrl+Alt+Q 退出）", 0x30)
         sys.exit(0)
     return mutex
 
@@ -277,6 +291,15 @@ class SettingsWindow:
 
         on_save_callback: 保存后更新外部 config 的回调，不再直接启动监控。
         """
+        global ctk, tk, messagebox
+        if ctk is None:
+            import customtkinter
+            import tkinter as _tk
+            from tkinter import messagebox as _mb
+            ctk = customtkinter
+            tk = _tk
+            messagebox = _mb
+
         self.config = config
         self._on_save_cb = on_save_callback
         self._standalone = standalone
@@ -671,15 +694,27 @@ def run_monitor(config):
     _app = app
     app.reset()  # 重置退出信号，防止上次遗留的 set 状态导致立即退出
 
+    # 打包模式下模型已封入 exe 目录，直接校验；源码模式下按需下载
     print("[*] 检查模型文件...", flush=True)
-    if not download_model("https://raw.githubusercontent.com/opencv/opencv/master/samples/dnn/face_detector/deploy.prototxt", PROTOTXT_PATH):
-        print("[!] prototxt 下载失败", flush=True)
-        messagebox.showerror("错误", "模型文件下载失败，请检查网络！")
-        return
-    if not download_model("https://raw.githubusercontent.com/opencv/opencv_3rdparty/dnn_samples_face_detector_20170830/res10_300x300_ssd_iter_140000.caffemodel", MODEL_PATH):
-        print("[!] caffemodel 下载失败", flush=True)
-        messagebox.showerror("错误", "模型文件下载失败，请检查网络！")
-        return
+    if getattr(sys, 'frozen', False):
+        if not os.path.exists(PROTOTXT_PATH):
+            print(f"[!] prototxt 缺失: {PROTOTXT_PATH}", flush=True)
+            _win_msgbox("错误", f"模型文件缺失:\n{PROTOTXT_PATH}")
+            return
+        if not os.path.exists(MODEL_PATH):
+            print(f"[!] caffemodel 缺失: {MODEL_PATH}", flush=True)
+            _win_msgbox("错误", f"模型文件缺失:\n{MODEL_PATH}")
+            return
+    else:
+        # 源码模式：首次运行时从 GitHub 下载
+        if not download_model("https://raw.githubusercontent.com/opencv/opencv/master/samples/dnn/face_detector/deploy.prototxt", PROTOTXT_PATH):
+            print("[!] prototxt 下载失败", flush=True)
+            _win_msgbox("错误", "模型文件下载失败，请检查网络！")
+            return
+        if not download_model("https://raw.githubusercontent.com/opencv/opencv_3rdparty/dnn_samples_face_detector_20170830/res10_300x300_ssd_iter_140000.caffemodel", MODEL_PATH):
+            print("[!] caffemodel 下载失败", flush=True)
+            _win_msgbox("错误", "模型文件下载失败，请检查网络！")
+            return
         
     print("[*] 正在加载神经网络...", flush=True)
     net = cv2.dnn.readNetFromCaffe(PROTOTXT_PATH, MODEL_PATH)
@@ -692,7 +727,7 @@ def run_monitor(config):
     cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
     if not cap.isOpened():
         print("[!] 无法打开摄像头！", flush=True)
-        messagebox.showerror("错误", "无法打开摄像头！可能被其他程序占用。")
+        _win_msgbox("错误", "无法打开摄像头！可能被其他程序占用。")
         return
 
     stealth_mode = config.stealth_mode
@@ -781,22 +816,32 @@ def _restart_as_monitor(mutex_handle):
     # 构建子进程命令
     if getattr(sys, 'frozen', False):
         cmd = [sys.executable, '--monitor']
+        # Frozen EXE 是 GUI 应用（console=False），不需要 CREATE_NO_WINDOW，
+        # 且此 flag 会干扰 PyInstaller bootloader 初始化导致子进程崩溃
+        flags = {}
     else:
         cmd = [sys.executable, os.path.abspath(sys.argv[0]), '--monitor']
+        flags = {'creationflags': getattr(subprocess, 'CREATE_NO_WINDOW', 0)}
 
-    # CREATE_NO_WINDOW 避免闪现控制台窗口
-    creationflags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
-    subprocess.Popen(cmd, creationflags=creationflags)
-    sys.exit(0)
+    subprocess.Popen(cmd, **flags)
+    # 使用 os._exit 强制立即终止，确保 Mutex 立刻释放供子进程使用
+    os._exit(0)
 
 
 def main():
     # --monitor 标志：直接启动监控（设置保存后子进程重启使用）
     if '--monitor' in sys.argv:
+        # 短暂等待确保父进程已释放 mutex 并退出完毕
+        time.sleep(0.15)
         _mutex = ensure_single_instance()
         config = load_config()
         if config.work_app_title:
-            run_monitor(config)
+            try:
+                run_monitor(config)
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                _win_msgbox("启动失败", f"监控启动异常:\n{type(e).__name__}: {e}")
         sys.exit(0)
 
     _mutex = ensure_single_instance()  # 持有引用防止 GC 释放
@@ -816,6 +861,14 @@ def main():
                 _restart_as_monitor(_mutex)
             sys.exit(0)
         else:
+            # 延迟导入 tkinter：非 --monitor 路径才需要
+            global tk, messagebox
+            if tk is None:
+                import tkinter as _tk
+                from tkinter import messagebox as _mb
+                tk = _tk
+                messagebox = _mb
+
             root = tk.Tk()
             root.withdraw()
 
