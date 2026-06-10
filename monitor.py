@@ -259,9 +259,11 @@ class SettingsWindow:
         """
         standalone=True:  首次启动设置（没有监控在跑），关闭=退出程序
         standalone=False: 从主弹窗"修改设置"进入，关闭=回到主弹窗
+
+        on_save_callback: 保存后更新外部 config 的回调，不再直接启动监控。
         """
         self.config = config
-        self.on_save_callback = on_save_callback
+        self._on_save_cb = on_save_callback
         self._standalone = standalone
         self._saved = False  # 标记用户是否点击了"保存并启动"
         self._title_exe_map = {}
@@ -465,14 +467,13 @@ class SettingsWindow:
         self.config.work_app_title = app_title
         self.config.cooldown_time = float(self.cooldown_var.get())
         self.config.stealth_mode = self.stealth_var.get()
-
         save_config(self.config)
         self._saved = True
         self._cleanup_vars()
-        self.root.destroy()
-
-        if self.on_save_callback:
-            self.on_save_callback(self.config)
+        # 通知外部更新 config（不再在此处启动监控，由 main() 在 mainloop 退出后启动）
+        if self._on_save_cb:
+            self._on_save_cb(self.config)
+        self.root.quit()
 
     def _cleanup_vars(self):
         """释放 tkinter 变量引用，避免退出时报 RuntimeError"""
@@ -484,14 +485,14 @@ class SettingsWindow:
                 pass
 
     def _on_close(self):
-        """关闭设置窗口。若为首次启动（standalone），退出程序；若为修改设置，只关窗口。"""
+        """关闭设置窗口。standalone 由调用者决定是否退出。"""
         self._cleanup_vars()
-        self.root.destroy()
-        if self._standalone:
-            sys.exit(0)
+        self.root.quit()
 
     def run(self):
+        """启动主循环。返回后由调用者决定后续流程。"""
         self.root.mainloop()
+        self.root.destroy()
 
 # ================= 窗口切换模块 =================
 class WindowReactor:
@@ -740,11 +741,16 @@ def main():
     while True:
         if not config.work_app_title:
             def on_save(new_config):
-                run_monitor(new_config)
+                # 仅更新 config，run_monitor 由 main() 在 mainloop 退出后调用
+                nonlocal config
+                config = new_config
 
             settings = SettingsWindow(config, on_save, standalone=True)
             settings.run()
-            sys.exit(0)  # 用户关闭首次设置窗口 → 退出
+
+            if settings._saved:
+                run_monitor(config)
+            sys.exit(0)
         else:
             root = tk.Tk()
             root.withdraw()
@@ -760,21 +766,21 @@ def main():
             if result is True:
                 root.destroy()
                 run_monitor(config)
-                return  # 监控退出 → 结束
+                return
             elif result is False:
                 root.destroy()
 
                 def on_save(new_config):
                     nonlocal config
                     config = new_config
-                    run_monitor(new_config)
 
                 settings = SettingsWindow(config, on_save, standalone=False)
                 settings.run()
 
                 if settings._saved:
-                    # 保存并启动了监控，run_monitor 已返回 → 结束
+                    run_monitor(config)
                     return
+                continue
                 # 用户关闭了设置窗口但没保存 → 回到主弹窗
                 continue
             else:
