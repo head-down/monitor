@@ -487,8 +487,8 @@ class SettingsWindow:
         # 通知外部更新 config（main() 在 run() 返回后启动 run_monitor）
         if self._on_save_cb:
             self._on_save_cb(self.config)
-        # quit 退出 mainloop，控件销毁由 run() 统一处理
-        self.root.quit()
+        # 用 after 延迟 quit，确保当前事件处理完成后再退出 mainloop
+        self.root.after(0, self.root.quit)
 
     def _cleanup_vars(self):
         """释放 tkinter 控件及其关联变量，避免退出时报 RuntimeError。
@@ -512,12 +512,17 @@ class SettingsWindow:
 
     def _on_close(self):
         """关闭设置窗口。standalone 由调用者决定是否退出。"""
-        self.root.quit()
+        self.root.after(0, self.root.quit)
 
     def run(self):
         """启动主循环。返回后由调用者决定后续流程。"""
         self.root.mainloop()
         self._cleanup_vars()
+        # 处理完所有挂起事件后再销毁，确保 quit 已完全生效
+        try:
+            self.root.update()
+        except Exception:
+            pass
         self.root.destroy()
 
 # ================= 窗口切换模块 =================
