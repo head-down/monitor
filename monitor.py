@@ -5,8 +5,11 @@ import urllib.request
 import pygetwindow as gw
 import pyautogui
 import ctypes
+from ctypes import wintypes
 import sys
 import json
+import threading
+import signal
 import tkinter as tk
 from tkinter import ttk, messagebox
 import customtkinter as ctk
@@ -18,6 +21,121 @@ except ImportError:
     HAS_PSUTIL = False
 
 from core.face_detector import FaceDetector
+
+# ================= 全局退出信号 =================
+_quit_event = threading.Event()
+
+
+def _quit_signal_handler(signum, frame):
+    """Ctrl+C / SIGTERM 处理器"""
+    if not _quit_event.is_set():
+        print("\n[*] 收到系统信号，正在退出...")
+    _quit_event.set()
+
+
+signal.signal(signal.SIGINT, _quit_signal_handler)
+if hasattr(signal, 'SIGTERM'):
+    signal.signal(signal.SIGTERM, _quit_signal_handler)
+
+
+class QuitWatcher:
+    """通过 Windows 全局热键 Ctrl+Alt+Q 触发退出，不依赖任何第三方库。"""
+
+    _HOTKEY_ID = 0xC001
+    MOD_ALT = 0x0001
+    MOD_CTRL = 0x0002
+    MOD_NOREPEAT = 0x4000
+    VK_Q = 0x51
+    PM_REMOVE = 1
+
+    def __init__(self):
+        self._thread = None
+        self._hk_registered = False
+
+    def start(self):
+        self._thread = threading.Thread(target=self._run, daemon=True, name="QuitWatcher")
+        self._thread.start()
+
+    def _run(self):
+        user32 = ctypes.windll.user32
+        if not user32.RegisterHotKey(None, self._HOTKEY_ID,
+                                     self.MOD_CTRL | self.MOD_ALT | self.MOD_NOREPEAT,
+                                     self.VK_Q):
+            print("[!] 注册退出热键失败（可能被其他程序占用）")
+            print("[!] 请通过任务管理器结束 moyu 相关进程")
+            return
+        self._hk_registered = True
+
+        try:
+            msg = wintypes.MSG()
+            while not _quit_event.is_set():
+                # 使用 PeekMessage 非阻塞轮询，避免 GetMessageW 阻塞在
+                # 内核导致 daemon 线程无法随主线程退出
+                if user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, self.PM_REMOVE):
+                    if msg.message == 0x0312 and msg.wParam == self._HOTKEY_ID:
+                        break
+                    user32.TranslateMessage(ctypes.byref(msg))
+                    user32.DispatchMessageW(ctypes.byref(msg))
+                else:
+                    time.sleep(0.05)
+        except Exception:
+            pass
+        finally:
+            if self._hk_registered:
+                user32.UnregisterHotKey(None, self._HOTKEY_ID)
+            _quit_event.set()
+
+
+class TrayIcon:
+    """系统托盘图标，右击弹出菜单可退出。基于 pystray + PIL 绘制图标。"""
+
+    def __init__(self, tooltip="摸鱼守护神"):
+        self._tooltip = tooltip
+        self._icon = None
+
+    def start(self):
+        """启动托盘图标（参考 eyecare 的 pystray 实现）。"""
+        import pystray
+
+        image = self._draw_icon_image()
+        menu = pystray.Menu(
+            pystray.MenuItem("退出摸鱼守护神 (Ctrl+Alt+Q)", self._on_quit, default=True),
+        )
+        self._icon = pystray.Icon("moyu_guardian", image, self._tooltip, menu)
+        threading.Thread(target=self._icon.run, daemon=True).start()
+
+    @staticmethod
+    def _draw_icon_image():
+        """用 PIL 绘制托盘图标，返回 PIL Image 对象。"""
+        from PIL import Image, ImageDraw
+        sz = 64
+        img = Image.new("RGBA", (sz, sz), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+
+        r = 4
+        draw.ellipse([r, r, sz - r - 1, sz - r - 1], fill=(30, 85, 180, 255))
+        draw.ellipse([12, 20, 52, 44], fill=(255, 255, 255, 255))
+        draw.ellipse([25, 25, 39, 39], fill=(25, 50, 100, 255))
+        draw.ellipse([29, 27, 35, 33], fill=(255, 255, 255, 200))
+
+        for dx in (18, 26, 34, 42):
+            draw.line([(dx, 14), (dx + 3, 20)], fill=(255, 255, 255, 180), width=2)
+
+        return img
+
+    def _on_quit(self, icon=None, item=None):
+        """菜单点击退出"""
+        _quit_event.set()
+        if self._icon:
+            self._icon.stop()
+
+    def stop(self):
+        """停止托盘图标"""
+        if self._icon:
+            try:
+                self._icon.stop()
+            except Exception:
+                pass
 
 # 禁用鼠标角落保护
 pyautogui.FAILSAFE = False
@@ -58,7 +176,8 @@ def load_config():
                 if key not in config:
                     config[key] = DEFAULT_CONFIG[key]
             return config
-        except:
+        except Exception:
+            print(f"[!] 读取配置文件失败，使用默认配置。")
             pass
     return DEFAULT_CONFIG.copy()
 
@@ -94,9 +213,15 @@ class SettingsWindow:
     WIDTH = 520
     HEIGHT = 600
 
-    def __init__(self, config, on_save_callback=None):
+    def __init__(self, config, on_save_callback=None, standalone=True):
+        """
+        standalone=True:  首次启动设置（没有监控在跑），关闭=退出程序
+        standalone=False: 从主弹窗"修改设置"进入，关闭=回到主弹窗
+        """
         self.config = config
         self.on_save_callback = on_save_callback
+        self._standalone = standalone
+        self._saved = False  # 标记用户是否点击了"保存并启动"
         self._title_exe_map = {}
 
         ctk.set_appearance_mode("system")
@@ -115,6 +240,9 @@ class SettingsWindow:
         self.root.geometry(f"{self.WIDTH}x{self.HEIGHT}+{x}+{y}")
 
         self.create_widgets()
+
+        # 首次启动自动加载窗口列表但不弹框
+        self.refresh_windows(show_popup=False)
 
     def create_widgets(self):
         # ===== 底部按钮（先 pack 到 bottom，确保始终可见） =====
@@ -191,7 +319,7 @@ class SettingsWindow:
         # 刷新按钮
         ctk.CTkButton(
             card, text="刷新窗口列表",
-            command=self.refresh_windows,
+            command=lambda: self.refresh_windows(show_popup=True),
             font=ctk.CTkFont(size=11),
             fg_color="transparent", border_width=1.2,
             text_color=("gray10", "gray90"),
@@ -258,15 +386,12 @@ class SettingsWindow:
             font=ctk.CTkFont(size=11), text_color="gray",
         ).pack(anchor="w", padx=(28, 0), pady=(3, 12))
 
-        # 初始加载窗口列表
-        self.refresh_windows()
-
     # ==================== 功能方法 ====================
 
     def _update_cd_label(self, value):
         self._cd_label.configure(text=f"{int(float(value))} 秒")
 
-    def refresh_windows(self):
+    def refresh_windows(self, show_popup=False):
         """刷新当前打开的窗口列表，排除文件资源管理器并去重 IDE 多文件窗口"""
         try:
             windows = gw.getAllWindows()
@@ -332,10 +457,11 @@ class SettingsWindow:
                     display_titles.append(title)
 
             self.app_combo.configure(values=display_titles)
-            messagebox.showinfo(
-                "提示",
-                f"已获取 {len(display_titles)} 个窗口（原始 {len(raw_titles)} 个）",
-            )
+            if show_popup:
+                messagebox.showinfo(
+                    "提示",
+                    f"已获取 {len(display_titles)} 个窗口（原始 {len(raw_titles)} 个）",
+                )
         except Exception as e:
             messagebox.showerror("错误", f"获取窗口列表失败: {e}")
 
@@ -360,15 +486,28 @@ class SettingsWindow:
         self.config["stealth_mode"] = self.stealth_var.get()
 
         save_config(self.config)
+        self._saved = True
+        self._cleanup_vars()
         self.root.destroy()
 
         if self.on_save_callback:
             self.on_save_callback(self.config)
 
+    def _cleanup_vars(self):
+        """释放 tkinter 变量引用，避免退出时报 RuntimeError"""
+        for attr in ('app_var', 'cooldown_var', 'stealth_var', '_exe_label_var',
+                      'app_combo', '_cd_label', '_cd_slider'):
+            try:
+                delattr(self, attr)
+            except Exception:
+                pass
+
     def _on_close(self):
-        """关闭设置窗口并退出程序"""
+        """关闭设置窗口。若为首次启动（standalone），退出程序；若为修改设置，只关窗口。"""
+        self._cleanup_vars()
         self.root.destroy()
-        sys.exit(0)
+        if self._standalone:
+            sys.exit(0)
 
     def run(self):
         self.root.mainloop()
@@ -388,7 +527,7 @@ class WindowReactor:
                 return False
 
             # 策略1：标题关键词匹配
-            if self._app_title in active.title:
+            if active.title and self._app_title in active.title:
                 return True
 
             # 策略2：进程名匹配（IDE 切文件后标题变了，但进程不变）
@@ -409,27 +548,41 @@ class WindowReactor:
         """
         查找目标窗口。
         策略：
-          1. 优先按进程名（psutil）找到所有属于该进程的窗口 hwnd，取第一个可见的。
-          2. 若无进程名或 psutil 不可用，退回到标题关键词模糊匹配。
-        这样即使 IDEA/Chrome 切换了文件，只要进程还在，就能找到。
+          1. 优先按进程名找到所有属于该进程的可见主窗口，取面积最大的。
+          2. 退回到标题关键词模糊匹配。
+        过滤工具窗口（如 IDE 的浮动工具栏），避免切到小窗。
         """
-        # --- 策略1：进程名精准匹配 ---
+        GWL_EXSTYLE = -20
+        WS_EX_TOOLWINDOW = 0x00000080
+
+        def _is_main_window(w):
+            """排除工具窗口和不可见窗口"""
+            if not w.visible or not w.title or not w.title.strip():
+                return False
+            ex_style = ctypes.windll.user32.GetWindowLongW(w._hWnd, GWL_EXSTYLE)
+            return not (ex_style & WS_EX_TOOLWINDOW)
+
+        # --- 策略1：进程名精准匹配，选面积最大的主窗口 ---
         if self._app_exe and HAS_PSUTIL:
             try:
-                import ctypes as _ct
                 target_pids = {
                     p.pid for p in psutil.process_iter(['name'])
                     if p.info['name'] and p.info['name'].lower() == self._app_exe.lower()
                 }
                 if target_pids:
-                    GetWindowThreadProcessId = _ct.windll.user32.GetWindowThreadProcessId
+                    GetWindowThreadProcessId = ctypes.windll.user32.GetWindowThreadProcessId
+                    candidates = []
                     for w in gw.getAllWindows():
-                        if not w.visible or not w.title:
+                        if not _is_main_window(w):
                             continue
-                        pid = _ct.c_ulong()
-                        GetWindowThreadProcessId(w._hWnd, _ct.byref(pid))
+                        pid = ctypes.c_ulong()
+                        GetWindowThreadProcessId(w._hWnd, ctypes.byref(pid))
                         if pid.value in target_pids:
-                            return w
+                            area = w.width * w.height if w.width > 0 and w.height > 0 else 0
+                            candidates.append((area, w))
+                    if candidates:
+                        candidates.sort(key=lambda x: -x[0])
+                        return candidates[0][1]
             except Exception as e:
                 print(f"[!] 进程查找窗口异常: {e}")
 
@@ -437,14 +590,44 @@ class WindowReactor:
         windows = gw.getWindowsWithTitle(self._app_title)
         return windows[0] if windows else None
 
+    def _force_foreground(self, hwnd):
+        """
+        绕过 Windows 前台窗口限制 (SetForegroundWindow 限制)。
+        用 AttachThreadInput 临时连接线程后强制置顶。
+        """
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+
+        fg_hwnd = user32.GetForegroundWindow()
+        fg_thread = user32.GetWindowThreadProcessId(fg_hwnd, None)
+        target_thread = user32.GetWindowThreadProcessId(hwnd, None)
+        cur_thread = kernel32.GetCurrentThreadId()
+
+        attached = False
+        if target_thread != fg_thread:
+            user32.AttachThreadInput(target_thread, fg_thread, True)
+            attached = True
+        if target_thread != cur_thread:
+            user32.AttachThreadInput(target_thread, cur_thread, True)
+            attached = True
+
+        try:
+            # 如果最小化了先恢复
+            if user32.IsIconic(hwnd):
+                user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+            user32.SetForegroundWindow(hwnd)
+        finally:
+            if attached:
+                if target_thread != fg_thread:
+                    user32.AttachThreadInput(target_thread, fg_thread, False)
+                if target_thread != cur_thread:
+                    user32.AttachThreadInput(target_thread, cur_thread, False)
+
     def _do_switch(self):
         win = self._find_window()
         if win:
             try:
-                win.minimize()
-                time.sleep(0.1)
-                win.restore()
-                win.activate()
+                self._force_foreground(win._hWnd)
                 return
             except Exception as e:
                 print(f"[!] 激活窗口失败: {e}")
@@ -460,49 +643,67 @@ class WindowReactor:
             return
         if self._is_target_active():
             print(f"[{time.strftime('%X')}] 目标窗口已在前台，跳过切换。")
-        else:
-            print(f"[{time.strftime('%X')}] 检测到多人！正在切换到 {self._app_title}...")
-            self._do_switch()
-        self._last_trigger = now
+            # 注意：目标已在前台时不重置冷却——下次真正需要切时不受影响
+            return
+        print(f"[{time.strftime('%X')}] 检测到多人！正在切换到 {self._app_title}...")
+        self._do_switch()
+        self._last_trigger = now  # 只在真正执行切屏时重置冷却
 
 # ================= 主程序 =================
 def run_monitor(config):
     """运行监控程序"""
+    _quit_event.clear()  # 重置退出信号，防止上次遗留的 set 状态导致立即退出
+
+    print("[*] 检查模型文件...", flush=True)
     if not download_model("https://raw.githubusercontent.com/opencv/opencv/master/samples/dnn/face_detector/deploy.prototxt", PROTOTXT_PATH):
+        print("[!] prototxt 下载失败", flush=True)
         messagebox.showerror("错误", "模型文件下载失败，请检查网络！")
         return
     if not download_model("https://raw.githubusercontent.com/opencv/opencv_3rdparty/dnn_samples_face_detector_20170830/res10_300x300_ssd_iter_140000.caffemodel", MODEL_PATH):
+        print("[!] caffemodel 下载失败", flush=True)
         messagebox.showerror("错误", "模型文件下载失败，请检查网络！")
         return
         
-    print("[*] 正在加载神经网络...")
+    print("[*] 正在加载神经网络...", flush=True)
     net = cv2.dnn.readNetFromCaffe(PROTOTXT_PATH, MODEL_PATH)
+    print("[*] 神经网络加载完成", flush=True)
 
     detector = FaceDetector(net)
     reactor = WindowReactor(config["work_app_title"], config.get("work_app_exe", ""), config["cooldown_time"])
 
+    print("[*] 正在打开摄像头...", flush=True)
     cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
     if not cap.isOpened():
+        print("[!] 无法打开摄像头！", flush=True)
         messagebox.showerror("错误", "无法打开摄像头！可能被其他程序占用。")
         return
 
     stealth_mode = config.get("stealth_mode", False)
 
+    # 全局热键退出
+    quit_watcher = QuitWatcher()
+    quit_watcher.start()
+
+    # 系统托盘图标（右击可退出）
+    tray = TrayIcon("摸鱼守护神 - 右击退出")
+    tray.start()
+
     print("=" * 50)
     print(f"摸鱼守护神已启动！")
     print(f"   目标应用: {config['work_app_title']}")
     print(f"   冷却时间: {config['cooldown_time']} 秒")
+    print(f"   退出方式: 右击系统托盘图标 或 按 Ctrl+Alt+Q")
     if not stealth_mode:
-        print("   按 ESC 键退出")
+        print("   也可按 ESC 键关闭预览窗口退出")
     else:
-        print("   隐蔽模式运行，通过任务管理器结束进程")
+        print("   隐蔽模式运行（无预览窗口，通过托盘图标或 Ctrl+Alt+Q 退出）")
     print("=" * 50)
 
     fail_count = 0
     MAX_FAIL = 30
 
     try:
-        while True:
+        while not _quit_event.is_set():
             success, image = cap.read()
             if not success:
                 fail_count += 1
@@ -527,51 +728,68 @@ def run_monitor(config):
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
                 cv2.putText(display_img, f"App: {config['work_app_title'][:30]}", (10, 60),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+                cv2.putText(display_img, "Ctrl+Alt+Q to quit", (10, 450),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (150, 150, 150), 1)
                 cv2.imshow('Moyu Guardian (ESC to quit)', display_img)
-                if cv2.waitKey(5) & 0xFF == 27:
+                key = cv2.waitKey(5) & 0xFF
+                if key == 27 or cv2.getWindowProperty('Moyu Guardian (ESC to quit)', cv2.WND_PROP_VISIBLE) < 1:
+                    _quit_event.set()
                     break
             else:
                 time.sleep(0.03)
     finally:
         cap.release()
         cv2.destroyAllWindows()
+        tray.stop()
+        print("[*] 摸鱼守护神已关闭。")
 
 def main():
     _mutex = ensure_single_instance()  # 持有引用防止 GC 释放
     config = load_config()
-    if not config.get("work_app_title"):
-        def on_save(new_config):
-            # 保存后直接启动监控
-            run_monitor(new_config)
-        
-        settings = SettingsWindow(config, on_save)
-        settings.run()
-        sys.exit(0)
-    else:
-        root = tk.Tk()
-        root.withdraw()
-        
-        result = messagebox.askyesnocancel(
-            "摸鱼守护神",
-            f"当前目标应用: {config['work_app_title']}\n\n"
-            "【是】- 直接启动\n"
-            "【否】- 修改设置\n"
-            "【取消】- 退出程序"
-        )
-        
-        if result is True:
-            root.destroy()
-            run_monitor(config)
-        elif result is False:
-            root.destroy()
+
+    while True:
+        if not config.get("work_app_title"):
             def on_save(new_config):
                 run_monitor(new_config)
-            settings = SettingsWindow(config, on_save)
+
+            settings = SettingsWindow(config, on_save, standalone=True)
             settings.run()
-            sys.exit(0)
+            sys.exit(0)  # 用户关闭首次设置窗口 → 退出
         else:
-            root.destroy()
-            sys.exit(0)
+            root = tk.Tk()
+            root.withdraw()
+
+            result = messagebox.askyesnocancel(
+                "摸鱼守护神",
+                f"当前目标应用: {config['work_app_title']}\n\n"
+                "【是】- 直接启动\n"
+                "【否】- 修改设置\n"
+                "【取消】- 退出程序"
+            )
+
+            if result is True:
+                root.destroy()
+                run_monitor(config)
+                return  # 监控退出 → 结束
+            elif result is False:
+                root.destroy()
+
+                def on_save(new_config):
+                    nonlocal config
+                    config = new_config
+                    run_monitor(new_config)
+
+                settings = SettingsWindow(config, on_save, standalone=False)
+                settings.run()
+
+                if settings._saved:
+                    # 保存并启动了监控，run_monitor 已返回 → 结束
+                    return
+                # 用户关闭了设置窗口但没保存 → 回到主弹窗
+                continue
+            else:
+                root.destroy()
+                sys.exit(0)
 
 if __name__ == '__main__':
     main()
