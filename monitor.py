@@ -484,10 +484,10 @@ class SettingsWindow:
         self.config.stealth_mode = self.stealth_var.get()
         save_config(self.config)
         self._saved = True
-        self._cleanup_vars()
-        # 通知外部更新 config（不再在此处启动监控，由 main() 在 mainloop 退出后启动）
+        # 通知外部更新 config（main() 在 run() 返回后启动 run_monitor）
         if self._on_save_cb:
             self._on_save_cb(self.config)
+        # quit 退出 mainloop，控件销毁由 run() 统一处理
         self.root.quit()
 
     def _cleanup_vars(self):
@@ -512,7 +512,6 @@ class SettingsWindow:
 
     def _on_close(self):
         """关闭设置窗口。standalone 由调用者决定是否退出。"""
-        self._cleanup_vars()
         self.root.quit()
 
     def run(self):
