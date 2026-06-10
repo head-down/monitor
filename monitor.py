@@ -23,14 +23,39 @@ except ImportError:
 from core.face_detector import FaceDetector
 
 # ================= 全局退出信号 =================
-_quit_event = threading.Event()
+
+class Application:
+    """管理程序生命周期和退出信号。
+
+    所有需要发起或响应退出请求的模块，均通过 Application 实例操作，
+    不直接访问任何模块级全局变量。
+    """
+    def __init__(self):
+        self._exit_event = threading.Event()
+
+    def request_exit(self):
+        """请求退出。幂等操作——多次调用效果相同。"""
+        self._exit_event.set()
+
+    def is_exit_requested(self):
+        """是否已请求退出。"""
+        return self._exit_event.is_set()
+
+    def reset(self):
+        """重置退出状态（每次启动监控时调用）。"""
+        self._exit_event.clear()
+
+
+# 信号处理器无法避免模块级引用：signal.signal() 的 API 要求模块级回调
+_app = None  # type: Application | None
 
 
 def _quit_signal_handler(signum, frame):
     """Ctrl+C / SIGTERM 处理器"""
-    if not _quit_event.is_set():
+    if _app and not _app.is_exit_requested():
         print("\n[*] 收到系统信号，正在退出...")
-    _quit_event.set()
+    if _app:
+        _app.request_exit()
 
 
 signal.signal(signal.SIGINT, _quit_signal_handler)
@@ -48,7 +73,8 @@ class QuitWatcher:
     VK_Q = 0x51
     PM_REMOVE = 1
 
-    def __init__(self):
+    def __init__(self, app):
+        self._app = app
         self._thread = None
         self._hk_registered = False
 
@@ -68,7 +94,7 @@ class QuitWatcher:
 
         try:
             msg = wintypes.MSG()
-            while not _quit_event.is_set():
+            while not self._app.is_exit_requested():
                 # 使用 PeekMessage 非阻塞轮询，避免 GetMessageW 阻塞在
                 # 内核导致 daemon 线程无法随主线程退出
                 if user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, self.PM_REMOVE):
@@ -83,13 +109,14 @@ class QuitWatcher:
         finally:
             if self._hk_registered:
                 user32.UnregisterHotKey(None, self._HOTKEY_ID)
-            _quit_event.set()
+            self._app.request_exit()
 
 
 class TrayIcon:
     """系统托盘图标，右击弹出菜单可退出。基于 pystray + PIL 绘制图标。"""
 
-    def __init__(self, tooltip="摸鱼守护神"):
+    def __init__(self, app, tooltip="摸鱼守护神"):
+        self._app = app
         self._tooltip = tooltip
         self._icon = None
 
@@ -125,7 +152,7 @@ class TrayIcon:
 
     def _on_quit(self, icon=None, item=None):
         """菜单点击退出"""
-        _quit_event.set()
+        self._app.request_exit()
         if self._icon:
             self._icon.stop()
 
@@ -652,7 +679,11 @@ class WindowReactor:
 # ================= 主程序 =================
 def run_monitor(config):
     """运行监控程序"""
-    _quit_event.clear()  # 重置退出信号，防止上次遗留的 set 状态导致立即退出
+    # 创建 Application 实例并设置模块级引用（供信号处理器使用）
+    global _app
+    app = Application()
+    _app = app
+    app.reset()  # 重置退出信号，防止上次遗留的 set 状态导致立即退出
 
     print("[*] 检查模型文件...", flush=True)
     if not download_model("https://raw.githubusercontent.com/opencv/opencv/master/samples/dnn/face_detector/deploy.prototxt", PROTOTXT_PATH):
@@ -681,11 +712,11 @@ def run_monitor(config):
     stealth_mode = config.get("stealth_mode", False)
 
     # 全局热键退出
-    quit_watcher = QuitWatcher()
+    quit_watcher = QuitWatcher(app)
     quit_watcher.start()
 
     # 系统托盘图标（右击可退出）
-    tray = TrayIcon("摸鱼守护神 - 右击退出")
+    tray = TrayIcon(app, "摸鱼守护神 - 右击退出")
     tray.start()
 
     print("=" * 50)
@@ -703,7 +734,7 @@ def run_monitor(config):
     MAX_FAIL = 30
 
     try:
-        while not _quit_event.is_set():
+        while not app.is_exit_requested():
             success, image = cap.read()
             if not success:
                 fail_count += 1
@@ -733,7 +764,7 @@ def run_monitor(config):
                 cv2.imshow('Moyu Guardian (ESC to quit)', display_img)
                 key = cv2.waitKey(5) & 0xFF
                 if key == 27 or cv2.getWindowProperty('Moyu Guardian (ESC to quit)', cv2.WND_PROP_VISIBLE) < 1:
-                    _quit_event.set()
+                    app.request_exit()
                     break
             else:
                 time.sleep(0.03)
