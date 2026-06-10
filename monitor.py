@@ -154,16 +154,21 @@ class TrayIcon:
     def _on_quit(self, icon=None, item=None):
         """菜单点击退出"""
         self._app.request_exit()
-        if self._icon:
-            self._icon.stop()
 
     def stop(self):
-        """停止托盘图标"""
+        """停止托盘图标。"""
         if self._icon:
+            # 静默 pystray 退出时可能的超时日志
+            import logging
+            pystray_logger = logging.getLogger("pystray")
+            prev_level = pystray_logger.level
+            pystray_logger.setLevel(logging.ERROR)
             try:
                 self._icon.stop()
             except Exception:
                 pass
+            finally:
+                pystray_logger.setLevel(prev_level)
 
 # 禁用鼠标角落保护
 pyautogui.FAILSAFE = False
@@ -476,7 +481,18 @@ class SettingsWindow:
         self.root.quit()
 
     def _cleanup_vars(self):
-        """释放 tkinter 变量引用，避免退出时报 RuntimeError"""
+        """释放 tkinter 控件及其关联变量，避免退出时报 RuntimeError。
+
+        customtkinter 的 ComboBox/Slider/CheckBox 内部持有 tkinter Variable，
+        必须先 destroy 控件再删除 Python 引用。
+        """
+        # 销毁所有子控件（Release 内部 Variable 引用）
+        for child in list(self.root.winfo_children()):
+            try:
+                child.destroy()
+            except Exception:
+                pass
+        # 删除 Python 属性引用
         for attr in ('app_var', 'cooldown_var', 'stealth_var', '_exe_label_var',
                       'app_combo', '_cd_label', '_cd_slider'):
             try:
@@ -492,6 +508,7 @@ class SettingsWindow:
     def run(self):
         """启动主循环。返回后由调用者决定后续流程。"""
         self.root.mainloop()
+        self._cleanup_vars()
         self.root.destroy()
 
 # ================= 窗口切换模块 =================
